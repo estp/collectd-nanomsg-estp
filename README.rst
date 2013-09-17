@@ -88,7 +88,7 @@ Then you can send data using the following command-line::
     nanocat --pub --connect tcp://127.0.0.1:6001 --delay=0.2 --data="ESTP:localhost:myapp:instance1:value: $(TZ=UTC date +"%Y-%m-%dT%H:%M:%SZ") 10 100"
 
 I assume that you on unix and have ``date`` utility. On Windows you may need
-to write date yourself. When submitting by hand, you may use shorter form:
+to write date yourself. When submitting by hand, you may use shorter form::
 
     nn_pub -l6001 -d0.2 -D"ESTP:localhost:myapp:instance1:value: $(TZ=UTC date +"%Y-%m-%dT%H:%M:%SZ") 10 100"
 
