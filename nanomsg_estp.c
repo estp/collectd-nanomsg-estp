@@ -1,9 +1,10 @@
 /**
- * collectd - src/zeromq_estp.c
+ * collectd - src/nanomsg_estp.c
  * Copyright (C) 2005-2010  Florian octo Forster
  * Copyright (C) 2009       Aman Gupta
  * Copyright (C) 2010       Julien Ammous
  * Copyright (C) 2012       Paul Colomiets
+ * Copyright (C) 2013       Insollo Entertainment, LLC
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -40,11 +41,12 @@
 #include <time.h>
 #include <stdio.h>
 
-#include <zmq.h>
+#include <nanomsg/nn.h>
+#include <nanomsg/pubsub.h>
+#include <nanomsg/pipeline.h>
 
 struct cmq_socket_s {
-    void *socket;
-    pthread_mutex_t mutex;
+    int socket;
 };
 typedef struct cmq_socket_s cmq_socket_t;
 
@@ -59,8 +61,6 @@ struct cmq_cache_entry_s {
 };
 typedef struct cmq_cache_entry_s cmq_cache_entry_t;
 
-static int cmq_threads_num = 1;
-static void *cmq_context = NULL;
 static c_avl_tree_t *staging = NULL;
 
 static pthread_t *receive_thread_ids = NULL;
@@ -69,15 +69,13 @@ static int        sending_sockets_num = 0;
 static pthread_mutex_t staging_mutex;
 
 // private data
-static int thread_running = 1;
-static pthread_t listen_thread_id;
+static int thread_running = 0;
 
 static void cmq_close_callback (void *value) /* {{{ */
 {
     cmq_socket_t *val = value;
-    if (val->socket != NULL)
-        (void) zmq_close (val->socket);
-    pthread_mutex_destroy(&val->mutex);
+    if (val->socket >= 0)
+        (void) nn_close (val->socket);
     free(value);
 } /* }}} void cmq_close_callback */
 
@@ -88,18 +86,18 @@ static void dispatch_entry(char *fullname, char *timestamp, time_t interval,
     strcpy(vl.type, vtype);
 
     if (!strptime (timestamp, "%Y-%m-%dT%H:%M:%SZ", &timest)) {
-        WARNING("ZeroMQ-ESTP: can't parse timestamp");
+        WARNING("Nanomsg-ESTP: can't parse timestamp");
         return;
     }
     // Hostname
     char *cpos = fullname;
     char *end = strchr(cpos, ':');
     if(!end) {
-        WARNING("ZeroMQ-ESTP: No delimiter after hostname");
+        WARNING("Nanomsg-ESTP: No delimiter after hostname");
         return;
     }
     if(end - cpos > 63) {
-        WARNING("ZeroMQ-ESTP: Too long hostname");
+        WARNING("Nanomsg-ESTP: Too long hostname");
         return;
     }
     memcpy(vl.host, cpos, end-cpos);
@@ -109,11 +107,11 @@ static void dispatch_entry(char *fullname, char *timestamp, time_t interval,
     cpos = end+1;
     end = strchr(cpos, ':');
     if(!end) {
-        WARNING("ZeroMQ-ESTP: No delimiter after application/subsystem name");
+        WARNING("Nanomsg-ESTP: No delimiter after application/subsystem name");
         return;
     }
     if(end - cpos > 63) {
-        WARNING("ZeroMQ-ESTP: Too long application/subsystem name");
+        WARNING("Nanomsg-ESTP: Too long application/subsystem name");
         return;
     }
     memcpy(vl.plugin, cpos, end-cpos);
@@ -123,11 +121,11 @@ static void dispatch_entry(char *fullname, char *timestamp, time_t interval,
     cpos = end+1;
     end = strchr(cpos, ':');
     if(!end) {
-        WARNING("ZeroMQ-ESTP: No delimiter after resource name");
+        WARNING("Nanomsg-ESTP: No delimiter after resource name");
         return;
     }
     if(end - cpos > 63) {
-        WARNING("ZeroMQ-ESTP: Too long resource name");
+        WARNING("Nanomsg-ESTP: Too long resource name");
         return;
     }
     memcpy(vl.plugin_instance, cpos, end-cpos);
@@ -137,11 +135,11 @@ static void dispatch_entry(char *fullname, char *timestamp, time_t interval,
     cpos = end+1;
     end = strchr(cpos, ':');
     if(!end) {
-        WARNING("ZeroMQ-ESTP: No delimiter after metric name");
+        WARNING("Nanomsg-ESTP: No delimiter after metric name");
         return;
     }
     if(end - cpos > 63) {
-        WARNING("ZeroMQ-ESTP: Too long metric name");
+        WARNING("Nanomsg-ESTP: Too long metric name");
         return;
     }
     memcpy(vl.type_instance, cpos, end-cpos);
@@ -159,7 +157,7 @@ static void dispatch_entry(char *fullname, char *timestamp, time_t interval,
 static char *find_suffix(char *fullname) {
     char *endsuffix = fullname + strlen(fullname)-1;
     if(*endsuffix != ':') {
-        WARNING("ZeroMQ-ESTP: Metric full name not ends with ':'");
+        WARNING("Nanomsg-ESTP: Metric full name not ends with ':'");
         return NULL;
     }
     char *suffix = endsuffix-1;
@@ -190,7 +188,7 @@ static int find_field(char *suffix, char *items) {
             }
         }
     }
-    WARNING("ZeroMQ-ESTP: Can't find suffix in list of suffixes");
+    WARNING("Nanomsg-ESTP: Can't find suffix in list of suffixes");
     return -1;
 }
 
@@ -228,7 +226,7 @@ static void dispatch_multi_entry (char *fullname, char *timestamp,
             }
             return;
         } else {
-            INFO("ZeroMQ-ESTP: Clearing cache entry as it is stale\n");
+            INFO("Nanomsg-ESTP: Clearing cache entry as it is stale\n");
             c_avl_remove(staging, cutname, NULL, NULL);
             free(entry);
         }
@@ -289,7 +287,7 @@ static void parse_message (char *data, int dlen)
     int rc = sscanf (hdata, "ESTP:%300s %31s %lu %63s",
                      fullname, timestamp, &interval, value);
     if (rc != 4) {
-        WARNING("ZeroMQ-ESTP: message has wrong format");
+        WARNING("Nanomsg-ESTP: message has wrong format");
         return;
     }
 
@@ -303,7 +301,7 @@ static void parse_message (char *data, int dlen)
         vdouble = 1;
     }
     if(end == hdata) {
-        WARNING("ZeroMQ-ESTP: wrong value");
+        WARNING("Nanomsg-ESTP: wrong value");
         return;
     }
 
@@ -335,7 +333,7 @@ static void parse_message (char *data, int dlen)
                 val.absolute = lvalue;
             }
         } else {
-            WARNING("ZeroMQ-ESTP: Unknown type");
+            WARNING("Nanomsg-ESTP: Unknown type");
             return;
         }
     } else {
@@ -384,36 +382,34 @@ static void parse_message (char *data, int dlen)
     dispatch_entry(fullname, timestamp, interval, vtype, 1, &val);
 }
 
-static void *receive_thread (void *cmq_socket) /* {{{ */
+static void *receive_thread (void *sock) /* {{{ */
 {
-    int status;
+    int rc;
+    char *buf;
+    int cmq_socket = (long)sock;
 
-    assert (cmq_socket != NULL);
+    assert (cmq_socket >= 0);
 
+    thread_running = 1;
     while (thread_running) {
-        zmq_msg_t msg;
-
-        (void) zmq_msg_init (&msg);
-
-        status = zmq_recv (cmq_socket, &msg, /* flags = */ 0);
-        if (status != 0) {
+        rc = nn_recv (cmq_socket, &buf, NN_MSG,  /* flags = */ 0);
+        if (rc < 0) {
             if ((errno == EAGAIN) || (errno == EINTR))
                 continue;
 
-            ERROR ("zeromq plugin: zmq_recv failed: %s", zmq_strerror (errno));
+            ERROR ("nanomsg plugin: nn_recv failed: %s", nn_strerror (errno));
             break;
         }
 
+        parse_message (buf, rc);
 
-        parse_message (zmq_msg_data (&msg), zmq_msg_size (&msg));
+        DEBUG("nanomsg plugin: received data, parse returned %d", rc);
 
-        DEBUG("zeromq plugin: received data, parse returned %d", status);
-
-        (void) zmq_msg_close (&msg);
+        (void) nn_freemsg (buf);
     } /* while (thread_running) */
 
-    DEBUG ("zeromq plugin: Receive thread is terminating.");
-    (void) zmq_close (cmq_socket);
+    DEBUG ("nanomsg plugin: Receive thread is terminating.");
+    (void) nn_close (cmq_socket);
 
     return (NULL);
 } /* }}} void *receive_thread */
@@ -451,33 +447,22 @@ static int put_single_value (cmq_socket_t *sockstr,
             vl->host, vl->plugin, vl->plugin_instance, name,
             tstring, interval, value.absolute, extdata);
     } else {
-        WARNING("ZeroMQ-ESTP: Unknown type");
+        WARNING("nanomsg: Unknown type");
         return -1;
     }
-    zmq_msg_t msg;
 
-    if(zmq_msg_init_size(&msg, datalen) != 0) {
-        ERROR("zmq_msg_init : %s", zmq_strerror(errno));
-        return 1;
-    }
-    memcpy(zmq_msg_data(&msg), data, datalen);
-
-    // try to send the message
-
-    pthread_mutex_lock(&sockstr->mutex);
-    int rc = zmq_send(sockstr->socket, &msg, ZMQ_NOBLOCK);
-    pthread_mutex_unlock(&sockstr->mutex);
-    if(rc != 0) {
+    int rc = nn_send(sockstr->socket, data, datalen, NN_DONTWAIT);
+    if(rc < 0) {
         if(errno == EAGAIN) {
-            WARNING("ZeroMQ: Unable to queue message, queue may be full");
+            WARNING("nanomsg: Unable to queue message, queue may be full");
             return -1;
         } else {
-            ERROR("zmq_send : %s", zmq_strerror(errno));
+            ERROR("nanomsg: nn_send failed: %s", nn_strerror(errno));
             return -1;
         }
     }
 
-    DEBUG("ZeroMQ: data sent");
+    DEBUG("nanomsg: data sent");
 
     return 0;
 }
@@ -544,15 +529,15 @@ static int cmq_config_mode (oconfig_item_t *ci) /* {{{ */
         return (-1);
 
     if (strcasecmp ("Publish", buffer) == 0)
-        return (ZMQ_PUB);
+        return (NN_PUB);
     else if (strcasecmp ("Subscribe", buffer) == 0)
-        return (ZMQ_SUB);
+        return (NN_SUB);
     else if (strcasecmp ("Push", buffer) == 0)
-        return (ZMQ_PUSH);
+        return (NN_PUSH);
     else if (strcasecmp ("Pull", buffer) == 0)
-        return (ZMQ_PULL);
+        return (NN_PULL);
 
-    ERROR ("zeromq plugin: Unrecognized communication pattern: \"%s\"",
+    ERROR ("nanomsg plugin: Unrecognized communication pattern: \"%s\"",
            buffer);
     return (-1);
 } /* }}} int cmq_config_mode */
@@ -563,40 +548,29 @@ static int cmq_config_socket (oconfig_item_t *ci) /* {{{ */
     int status;
     int i;
     int endpoints_num;
-    void *cmq_socket;
+    int cmq_socket;
 
     type = cmq_config_mode (ci);
     if (type < 0)
         return (-1);
 
-    if (cmq_context == NULL) {
-        cmq_context = zmq_init (cmq_threads_num);
-        if (cmq_context == NULL) {
-            ERROR ("zeromq plugin: Initializing ZeroMQ failed: %s",
-                   zmq_strerror (errno));
-            return (-1);
-        }
-
-        INFO("ZeroMQ: Using %d threads", cmq_threads_num);
-    }
-
     /* Create a new socket */
-    cmq_socket = zmq_socket (cmq_context, type);
-    if (cmq_socket == NULL) {
-        ERROR ("zeromq plugin: zmq_socket failed: %s",
-               zmq_strerror (errno));
+    cmq_socket = nn_socket (AF_SP, type);
+    if (cmq_socket < 0) {
+        ERROR ("nanomsg plugin: nn_socket failed: %s",
+               nn_strerror (errno));
         return (-1);
     }
 
-    if (type == ZMQ_SUB) {
+    if (type == NN_SUB) {
         /* Subscribe to all messages */
         /* TODO(tailhook) implement subscription configuration */
-        status = zmq_setsockopt (cmq_socket, ZMQ_SUBSCRIBE,
+        status = nn_setsockopt (cmq_socket, NN_SUB, NN_SUB_SUBSCRIBE,
                                  /* prefix = */ "", /* prefix length = */ 0);
         if (status != 0) {
-            ERROR ("zeromq plugin: zmq_setsockopt (ZMQ_SUBSCRIBE) failed: %s",
-                   zmq_strerror (errno));
-            (void) zmq_close (cmq_socket);
+            ERROR ("nanomsg plugin: nn_setsockopt (NN_SUB_SUBSCRIBE) failed: %s",
+                   nn_strerror (errno));
+            (void) nn_close (cmq_socket);
             return (-1);
         }
     }
@@ -614,10 +588,10 @@ static int cmq_config_socket (oconfig_item_t *ci) /* {{{ */
                 continue;
 
             DEBUG("Binding to %s", value);
-            status = zmq_bind (cmq_socket, value);
-            if (status != 0) {
-                ERROR ("zeromq plugin: zmq_bind (\"%s\") failed: %s",
-                       value, zmq_strerror (errno));
+            status = nn_bind (cmq_socket, value);
+            if (status < 0) {
+                ERROR ("nanomsg plugin: nn_bind (\"%s\") failed: %s",
+                       value, nn_strerror (errno));
                 sfree (value);
                 continue;
             }
@@ -632,10 +606,10 @@ static int cmq_config_socket (oconfig_item_t *ci) /* {{{ */
                 continue;
 
             DEBUG("Connecting to %s", value);
-            status = zmq_connect (cmq_socket, value);
-            if (status != 0) {
-                ERROR ("zeromq plugin: zmq_connect (\"%s\") failed: %s",
-                       value, zmq_strerror (errno));
+            status = nn_connect (cmq_socket, value);
+            if (status < 0) {
+                ERROR ("nanomsg plugin: nn_connect (\"%s\") failed: %s",
+                       value, nn_strerror (errno));
                 sfree (value);
                 continue;
             }
@@ -645,46 +619,28 @@ static int cmq_config_socket (oconfig_item_t *ci) /* {{{ */
             endpoints_num++;
             continue;
         } /* Connect */
-        else if( strcasecmp("HWM", child->key) == 0 ) {
-            int tmp;
-            uint64_t hwm;
-
-            status = cf_util_get_int(child, &tmp);
-            if( status != 0 )
-                continue;
-
-            hwm = (uint64_t) tmp;
-
-            status = zmq_setsockopt (cmq_socket, ZMQ_HWM, &hwm, sizeof(hwm));
-            if (status != 0) {
-                ERROR ("zeromq plugin: zmq_setsockopt (ZMQ_HWM) failed: %s", zmq_strerror (errno));
-                (void) zmq_close (cmq_socket);
-                return (-1);
-            }
-
-            continue;
-        } /* HWM */
         else {
-            ERROR ("zeromq plugin: The \"%s\" config option is now allowed here.",
+            ERROR ("nanomsg plugin: The \"%s\" config option is now allowed here.",
                    child->key);
         }
     } /* for (i = 0; i < ci->children_num; i++) */
 
     if (endpoints_num == 0) {
-        ERROR ("zeromq plugin: No (valid) \"Bind\"/\"Connect\" "
+        ERROR ("nanomsg plugin: No (valid) \"Bind\"/\"Connect\" "
                "option was found in this \"Socket\" block.");
-        (void) zmq_close (cmq_socket);
+        (void) nn_close (cmq_socket);
         return (-1);
     }
 
     /* If this is a receiving socket, create a new receive thread */
-    if ((type == ZMQ_SUB) || (type == ZMQ_PULL)) {
+
+    if ((type == NN_SUB) || (type == NN_PULL)) {
         pthread_t *thread_ptr;
 
         thread_ptr = realloc (receive_thread_ids,
                               sizeof (*receive_thread_ids) * (receive_thread_num + 1));
         if (thread_ptr == NULL) {
-            ERROR ("zeromq plugin: realloc failed.");
+            ERROR ("nanomsg plugin: realloc failed.");
             return (-1);
         }
         receive_thread_ids = thread_ptr;
@@ -693,12 +649,12 @@ static int cmq_config_socket (oconfig_item_t *ci) /* {{{ */
         status = pthread_create (thread_ptr,
                                  /* attr = */ NULL,
                                  /* func = */ receive_thread,
-                                 /* args = */ cmq_socket);
+                                 /* args = */ (void *)(long)cmq_socket);
         if (status != 0) {
             char errbuf[1024];
-            ERROR ("zeromq plugin: pthread_create failed: %s",
+            ERROR ("nanomsg plugin: pthread_create failed: %s",
                    sstrerror (errno, errbuf, sizeof (errbuf)));
-            (void) zmq_close (cmq_socket);
+            (void) nn_close (cmq_socket);
             return (-1);
         }
 
@@ -706,24 +662,23 @@ static int cmq_config_socket (oconfig_item_t *ci) /* {{{ */
     }
 
     /* If this is a sending socket, register a new write function */
-    else if ((type == ZMQ_PUB) || (type == ZMQ_PUSH)) {
+    else if ((type == NN_PUB) || (type == NN_PUSH)) {
         user_data_t ud = { NULL, NULL };
         char name[20];
         cmq_socket_t *sockstr = malloc(sizeof(cmq_socket_t));
         if(!sockstr) {
             char errbuf[1024];
-            ERROR ("zeromq plugin: malloc failed: %s",
+            ERROR ("nanomsg plugin: malloc failed: %s",
                    sstrerror (errno, errbuf, sizeof (errbuf)));
-            (void) zmq_close (cmq_socket);
+            (void) nn_close (cmq_socket);
             return (-1);
         }
 
         sockstr->socket = cmq_socket;
-        pthread_mutex_init(&sockstr->mutex, NULL);
         ud.data = sockstr;
         ud.free_func = cmq_close_callback;
 
-        ssnprintf (name, sizeof (name), "zeromq/%i", sending_sockets_num);
+        ssnprintf (name, sizeof (name), "nanomsg/%i", sending_sockets_num);
         sending_sockets_num++;
 
         plugin_register_write (name, write_value, &ud);
@@ -735,11 +690,8 @@ static int cmq_config_socket (oconfig_item_t *ci) /* {{{ */
 /*
  * Config schema:
  *
- * <Plugin "zeromq_estp">
- *   Threads 2
- *
+ * <Plugin "nanomsg_estp">
  *   <Socket Publish>
- *     HWM 300
  *     Connect "tcp://localhost:6666"
  *   </Socket>
  *   <Socket Subscribe>
@@ -756,16 +708,14 @@ static int cmq_config (oconfig_item_t *ci) /* {{{ */
     for (i = 0; i < ci->children_num; i++) {
         oconfig_item_t *child = ci->children + i;
 
-        if (strcasecmp ("Socket", child->key) == 0)
+        if (strcasecmp ("Socket", child->key) == 0) {
             status = cmq_config_socket (child);
-        else if (strcasecmp ("Threads", child->key) == 0) {
-            int tmp = 0;
-            status = cf_util_get_int (child, &tmp);
-            if ((status == 0) && (tmp >= 1))
-                cmq_threads_num = tmp;
+            if(status < 0) {
+                return status;
+            }
         } else {
-            WARNING ("zeromq plugin: The \"%s\" config option is not allowed here.",
-                     child->key);
+            WARNING ("nanomsg plugin: "
+                "The \"%s\" config option is not allowed here.", child->key);
         }
     }
 
@@ -774,13 +724,31 @@ static int cmq_config (oconfig_item_t *ci) /* {{{ */
 
 static int plugin_init (void)
 {
-    int major, minor, patch;
-    zmq_version (&major, &minor, &patch);
-    INFO("ZeroMQ plugin loaded (zeromq v%d.%d.%d).", major, minor, patch);
+    int i, symval;
+    const char *symname;
+    int version, revision, age;
+
+    version = 0;
+    revision = 0;
+    age = 0;
+    for(i = 0;;++i) {
+        symname = nn_symbol(i, &symval);
+        if(!symname)
+            break;
+        if(!strcmp(symname, "NN_VERSION_CURRENT"))
+            version = symval;
+        if(!strcmp(symname, "NN_VERSION_REVISION"))
+            revision = symval;
+        if(!strcmp(symname, "NN_VERSION_AGE"))
+            age = symval;
+    }
+
+    INFO("nanomsg plugin loaded (nanomsg v%d.%d.%d).",
+        version, revision, age);
     pthread_mutex_init(&staging_mutex, NULL);
     staging = c_avl_create ((void *) strcmp);
     if (staging == NULL) {
-        ERROR("ZeroMQ-ESTP : c_avl_create failed: %s", strerror(errno));
+        ERROR("Nanomsg-ESTP : c_avl_create failed: %s", strerror(errno));
         return -1;
     }
     return 0;
@@ -788,19 +756,13 @@ static int plugin_init (void)
 
 static int my_shutdown (void)
 {
-    if( cmq_context ) {
+    if( thread_running ) {
 
         thread_running = 0;
 
-        DEBUG("ZeroMQ: shutting down");
+        DEBUG("nanomsg: shutting down");
 
-        if( zmq_term(cmq_context) != 0 ) {
-            ERROR("zmq_term : %s", zmq_strerror(errno));
-            return 1;
-        }
-
-        pthread_join(listen_thread_id, NULL);
-
+        nn_term();
     }
 
     if( staging ) {
@@ -825,8 +787,8 @@ static int my_shutdown (void)
 
 void module_register (void)
 {
-    plugin_register_complex_config("zeromq_estp", cmq_config);
-    plugin_register_init("zeromq_estp", plugin_init);
-    plugin_register_shutdown ("zeromq_estp", my_shutdown);
+    plugin_register_complex_config("nanomsg_estp", cmq_config);
+    plugin_register_init("nanomsg_estp", plugin_init);
+    plugin_register_shutdown ("nanomsg_estp", my_shutdown);
 }
 
