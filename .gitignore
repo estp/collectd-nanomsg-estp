@@ -1,1 +1,3 @@
 /nanomsg_estp.so
+/collectd
+/collectd-*.tar.gz
