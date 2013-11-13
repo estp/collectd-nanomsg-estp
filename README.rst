@@ -16,16 +16,53 @@ to send data between collectd instances too
 Building
 ========
 
-The following is a basic build process::
+Ubuntu
+------
 
-    git submodule update --init
-    make
+For the impatient (tested for Ubuntu Precise)::
+
+    apt-get install collectd-dev libsensors4-dev
+    make CFLAGS="-I/usr/include/collectd"
     sudo make install
 
-Note: the build process clones full collectd repository and runs "configure" on
-it. You can ignore the whole configure output, as nothing except header files
-are used from collectd itself. If there is better way to build collectd plugin
-please send pull requests.
+If this doesn't work, longer instructions follow. (It assumes you have nanomsg
+installed)
+
+You need collectd headers somewhere, to build the plugin. In ubuntu they
+are at ``/usr/include/collectd`` in the ``collectd-dev`` package. The collectd
+headers may be ``./configure``'d with bigger number of libs installed than
+what ``collectd-dev`` depends on. So if you see ``No such file or directory``
+you need to install some other library's headers (``*-dev`` package) to build
+the plugin.
+
+To compile you need ``CFLAGS="-I/usr/include/collect"`` parameter to make
+as it's the directory where include files are installed to.
+
+Other Systems
+-------------
+
+There are three cases:
+
+1. There is package that installs header files. Instructions are
+   mostly same as with ubuntu, just you may need to adjust package names and
+   directory
+
+2. You compile collectd from source. Just set the environment variable
+   ``CFLAGS="-I/path/to/collectd-sources/src"`` for make
+
+3. You need to fetch collectd sources of the correct version and configure
+   them, its very recommended that arguments to ``./configure`` are same, that
+   used to compile ``collectd``. The process is roughly following::
+
+   wget http://collectd.org/files/collectd-v4.10.1.tar.gz
+   tar -xzf collectd-v4.10.1.tar.gz
+   cd collect-v4.10.1
+   ./configure --prefix=/usr ...
+   cd ..
+   make CFLAGS="-Icollectd-v4.10.1/src
+   make install
+
+
 
 
 Configuration

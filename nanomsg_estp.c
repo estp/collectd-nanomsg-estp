@@ -26,6 +26,7 @@
  **/
 
 #define _GNU_SOURCE
+#include "config.h"
 #include "collectd.h"
 #include "common.h" /* auxiliary functions */
 #include "plugin.h" /* plugin_register_*, plugin_dispatch_values */
