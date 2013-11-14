@@ -46,6 +46,12 @@
 #include <nanomsg/pubsub.h>
 #include <nanomsg/pipeline.h>
 
+#ifndef TIME_T_TO_CDTIME_T
+/*  Older versions with do not have CDTIME_T just use time_t  */
+#define TIME_T_TO_CDTIME_T(tm) (tm)
+#define CDTIME_T_TO_TIME_T(tm) (tm)
+#endif
+
 struct cmq_socket_s {
     int socket;
 };
